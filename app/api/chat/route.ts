@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server';
 import OpenAI from 'openai';
+import { ChatRequest } from '@/types';
 
 const YANDEX_FOLDER_ID = process.env.YC_FOLDER_ID;
 const YANDEX_API_KEY = process.env.YC_API_KEY;
@@ -12,40 +13,47 @@ const openai = new OpenAI({
 
 export async function POST(req: Request) {
   try {
-    const { messages } = await req.json();
+    const { messages }: ChatRequest = await req.json();
 
-    const yandexMessages = messages.map((msg: any) => {
-      let content = msg.content || msg.text || '';
-
-      if (msg.parts) {
-        content = msg.parts
-          .filter((part: any) => part.type === 'text')
-          .map((part: any) => part.text)
-          .join('');
-      }
-
-      return {
-        role: msg.role === 'user' ? 'user' : 'assistant',
-        content: content,
-      };
-    });
-
-    if (yandexMessages.length === 0) {
+    if (messages.length === 0) {
       return NextResponse.json({ error: 'No messages' }, { status: 400 });
     }
 
-    const response = await openai.chat.completions.create({
+    const stream = await openai.chat.completions.create({
       model: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite`,
-      messages: yandexMessages,
+      messages: messages,
       temperature: 0.7,
       max_tokens: 1500,
+      stream: true,
     });
 
-    const answer = response.choices[0]?.message?.content || '';
+    const encoder = new TextEncoder();
+    const readableStream = new ReadableStream({
+      async start(controller) {
+        try {
+          for await (const chunk of stream) {
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+              const data = JSON.stringify({ text: content });
+              controller.enqueue(encoder.encode(`data: ${data}\n\n`));
+            }
+          }
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        } catch (error) {
+          console.error('❌ Ошибка стрима:', error);
+          controller.error(error);
+        }
+      },
+    });
 
-    return NextResponse.json({
-      role: 'assistant',
-      content: answer,
+    return new Response(readableStream, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache, no-transform',
+        Connection: 'keep-alive',
+        'X-Accel-Buffering': 'no',
+      },
     });
   } catch (error) {
     console.error('❌ Ошибка:', error);
