@@ -1,11 +1,7 @@
 'use client';
 
 import { useState, FormEvent, useRef, useEffect } from 'react';
-
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-}
+import { Message } from '@/types';
 
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
@@ -13,10 +9,11 @@ export default function Chat() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const [currentAssistantMessage, setCurrentAssistantMessage] = useState('');
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
+  }, [messages, currentAssistantMessage]);
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -28,6 +25,7 @@ export default function Chat() {
     setInput('');
     setIsLoading(true);
     setError(null);
+    setCurrentAssistantMessage('');
 
     try {
       const response = await fetch('/api/chat', {
@@ -40,25 +38,81 @@ export default function Chat() {
         }),
       });
 
-      const data = await response.json();
-
       if (!response.ok) {
-        throw new Error(data.error || 'Ошибка сервера');
+        const errorData = await response.json();
+        throw new Error(errorData.error || 'Ошибка сервера');
       }
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          role: 'assistant',
-          content: data.content || 'Пустой ответ',
-        },
-      ]);
+      const reader = response.body?.getReader();
+      const decoder = new TextDecoder();
+      let assistantContent = '';
+      let isFirstChunk = true;
+
+      if (!reader) {
+        throw new Error('No response body');
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        const chunk = decoder.decode(value, { stream: true });
+        const lines = chunk.split('\n');
+
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const data = line.slice(6);
+
+            if (data === '[DONE]') {
+              continue;
+            }
+
+            try {
+              const parsed = JSON.parse(data);
+              const textChunk = parsed.text || '';
+
+              if (textChunk) {
+                assistantContent += textChunk;
+                setCurrentAssistantMessage(assistantContent);
+
+                if (isFirstChunk) {
+                  setMessages((prev) => [
+                    ...prev,
+                    { role: 'assistant', content: '' },
+                  ]);
+                  isFirstChunk = false;
+                }
+
+                setMessages((prev) => {
+                  const newMessages = [...prev];
+                  const lastIndex = newMessages.length - 1;
+                  if (newMessages[lastIndex]?.role === 'assistant') {
+                    newMessages[lastIndex] = {
+                      ...newMessages[lastIndex],
+                      content: assistantContent,
+                    };
+                  }
+                  return newMessages;
+                });
+              }
+            } catch (e) {
+              console.error('❌ Ошибка парсинга:', e);
+            }
+          }
+        }
+      }
+
+      if (!assistantContent) {
+        setMessages((prev) => prev.filter((msg) => msg.content.trim() !== ''));
+        setError('Получен пустой ответ от AI');
+      }
     } catch (error) {
       console.error('❌ Ошибка:', error);
       setError(error instanceof Error ? error.message : 'Неизвестная ошибка');
       setMessages((prev) => prev.slice(0, -1));
     } finally {
       setIsLoading(false);
+      setCurrentAssistantMessage('');
     }
   };
 
@@ -97,13 +151,15 @@ export default function Chat() {
               <div className="text-xs opacity-70 mb-1">
                 {msg.role === 'user' ? '🧑 Вы' : '🤖 AI'}
               </div>
-              <div className="whitespace-pre-wrap">{msg.content}</div>
+              <div className="whitespace-pre-wrap">
+                {msg.content || <span className="text-gray-400">...</span>}
+              </div>
             </div>
           ))
         )}
         {isLoading && (
           <div className="bg-white border border-gray-200 rounded-lg p-3 max-w-[80%]">
-            <div className="text-gray-500">⏳ Думаю...</div>
+            <div className="text-gray-500">⏳ Печатает...</div>
           </div>
         )}
         {error && (
@@ -125,7 +181,7 @@ export default function Chat() {
         <button
           type="submit"
           disabled={isLoading || !input.trim()}
-          className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed"
+          className="px-6 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
         >
           {isLoading ? '⏳' : '📤 Отправить'}
         </button>
