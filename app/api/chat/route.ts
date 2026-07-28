@@ -14,23 +14,35 @@ export async function POST(req: Request) {
   try {
     const { messages } = await req.json();
 
-    const lastMessage = messages[messages.length - 1];
-    const userText = lastMessage?.text || lastMessage?.content || '';
+    const yandexMessages = messages.map((msg: any) => {
+      let content = msg.content || msg.text || '';
 
-    if (!userText.trim()) {
-      return NextResponse.json({ error: 'Empty message' }, { status: 400 });
-    }
+      if (msg.parts) {
+        content = msg.parts
+          .filter((part: any) => part.type === 'text')
+          .map((part: any) => part.text)
+          .join('');
+      }
 
-    const response = await openai.responses.create({
-      model: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite`,
-      input: userText,
-      temperature: 0.7,
-      max_output_tokens: 1500,
+      return {
+        role: msg.role === 'user' ? 'user' : 'assistant',
+        content: content,
+      };
     });
 
-    const answer = response.output_text || '';
+    if (yandexMessages.length === 0) {
+      return NextResponse.json({ error: 'No messages' }, { status: 400 });
+    }
 
-    // 5. Возвращаем ответ
+    const response = await openai.chat.completions.create({
+      model: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite`,
+      messages: yandexMessages,
+      temperature: 0.7,
+      max_tokens: 1500,
+    });
+
+    const answer = response.choices[0]?.message?.content || '';
+
     return NextResponse.json({
       role: 'assistant',
       content: answer,
