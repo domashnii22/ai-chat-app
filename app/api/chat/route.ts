@@ -1,14 +1,13 @@
+import { FilteredMessage, Message } from '@/types';
 import { NextResponse } from 'next/server';
 
 const YANDEX_FOLDER_ID = process.env.YC_FOLDER_ID;
 const YANDEX_API_KEY = process.env.YC_API_KEY;
 const YANDEX_BASE_URL = 'https://llm.api.cloud.yandex.net/foundationModels/v1';
 
-const delay = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
-function filterHistory(messages: Array<{ role: string; content: string }>) {
+function filterHistory(messages: Array<Message>) {
   const MAX_HISTORY = 20;
-  const filtered: Array<{ role: 'user' | 'assistant'; text: string }> = [];
+  const filtered: Array<FilteredMessage> = [];
 
   const errorPhrases = [
     'Модель вернула пустой ответ',
@@ -97,6 +96,7 @@ export async function POST(req: Request) {
 
     if (!response.ok) {
       const errorText = await response.text();
+      console.error('❌ Yandex API Error:', response.status, errorText);
       return NextResponse.json(
         { error: `Yandex API error: ${response.status}` },
         { status: response.status },
@@ -117,7 +117,7 @@ export async function POST(req: Request) {
 
         try {
           let fullResponse = '';
-          let isFirstChunk = true;
+          let accumulatedText = '';
 
           while (true) {
             const { done, value } = await reader.read();
@@ -133,78 +133,56 @@ export async function POST(req: Request) {
               const trimmedLine = line.trim();
               if (!trimmedLine) continue;
 
+              let text = '';
+
               if (trimmedLine.startsWith('data: ')) {
                 const data = trimmedLine.slice(6).trim();
                 if (data === '[DONE]') continue;
 
                 try {
                   const json = JSON.parse(data);
-                  const text = json.result?.alternatives?.[0]?.message?.text;
-                  if (text) {
-                    fullResponse += text;
-
-                    // ✅ Проверяем, есть ли этот текст в истории
-                    const lastAssistantMessage = filteredMessages
-                      .filter((m: any) => m.role === 'assistant')
-                      .pop();
-
-                    if (lastAssistantMessage && isFirstChunk) {
-                      const historyText = lastAssistantMessage.text;
-                      if (historyText && text.includes(historyText)) {
-                        isFirstChunk = false;
-                        continue;
-                      }
-                    }
-
-                    isFirstChunk = false;
-
-                    controller.enqueue(
-                      encoder.encode(`data: ${JSON.stringify({ text })}\n\n`),
-                    );
-                  }
+                  text = json.result?.alternatives?.[0]?.message?.text || '';
                 } catch (e) {
                   console.error('❌ Ошибка парсинга SSE:', e);
                 }
               } else if (trimmedLine.startsWith('{')) {
                 try {
                   const json = JSON.parse(trimmedLine);
-                  const text = json.result?.alternatives?.[0]?.message?.text;
-                  if (text) {
-                    fullResponse += text;
-
-                    const lastAssistantMessage = filteredMessages
-                      .filter((m: any) => m.role === 'assistant')
-                      .pop();
-
-                    if (lastAssistantMessage && isFirstChunk) {
-                      const historyText = lastAssistantMessage.text;
-                      if (historyText && text.includes(historyText)) {
-                        isFirstChunk = false;
-                        continue;
-                      }
-                    }
-
-                    isFirstChunk = false;
-
-                    const words = text.split(' ');
-                    for (let i = 0; i < words.length; i++) {
-                      const word = words[i] + (i < words.length - 1 ? ' ' : '');
-                      controller.enqueue(
-                        encoder.encode(
-                          `data: ${JSON.stringify({ text: word })}\n\n`,
-                        ),
-                      );
-                      await delay(30);
-                    }
-                  }
+                  text = json.result?.alternatives?.[0]?.message?.text || '';
                 } catch (e) {
                   console.error('❌ Ошибка парсинга JSON:', e);
+                }
+              }
+
+              if (text) {
+                if (accumulatedText && text.includes(accumulatedText)) {
+                  const newPart = text.replace(accumulatedText, '');
+                  if (newPart) {
+                    accumulatedText = text;
+                    fullResponse += newPart;
+                    controller.enqueue(
+                      encoder.encode(
+                        `data: ${JSON.stringify({ text: newPart })}\n\n`,
+                      ),
+                    );
+                  } else {
+                    console.log(
+                      `⏭️ Пропускаем дублирующийся чанк (уже отправлен)`,
+                    );
+                  }
+                } else {
+                  accumulatedText = text;
+                  fullResponse += text;
+                  controller.enqueue(
+                    encoder.encode(`data: ${JSON.stringify({ text })}\n\n`),
+                  );
                 }
               }
             }
           }
 
           if (!fullResponse || fullResponse.trim() === '') {
+            console.warn('⚠️ Пустой ответ от Yandex');
             const errorMsg =
               '🤖 Модель вернула пустой ответ. Попробуйте переформулировать вопрос.';
             controller.enqueue(
