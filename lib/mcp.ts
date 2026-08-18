@@ -118,7 +118,7 @@ function promptContentToText(
 
 export async function getMCPPrompt(
   name: string,
-  args: Record<string, unknown> = {},
+  args: Record<string, string> = {},
 ): Promise<string> {
   const result = await withReconnect((c) =>
     c.getPrompt({ name, arguments: args }),
@@ -211,8 +211,7 @@ export async function callMCPTool(
   }
 
   if (name === 'get_prompt') {
-    const promptArgs =
-      (args.arguments as Record<string, unknown> | undefined) ?? {};
+    const promptArgs = (args.arguments as Record<string, string> | undefined) ?? {};
     return getMCPPrompt(String(args.name), promptArgs);
   }
 

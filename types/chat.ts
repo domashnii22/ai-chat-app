@@ -13,7 +13,7 @@ export interface Message {
  * Может содержать текст или вызовы функций.
  */
 export interface YandexMessage {
-  role: 'user' | 'assistant';
+  role: 'user' | 'assistant' | 'system';
   text?: string;
   toolCallList?: {
     toolCalls: Array<{

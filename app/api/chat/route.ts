@@ -1,6 +1,7 @@
 // app/api/chat/route.ts
 import { FilteredMessage, Message } from '@/types';
 import { callMCPTool, getMCPTools } from '@/lib/mcp';
+import { buildRagContext } from '@/lib/rag';
 import { NextResponse } from 'next/server';
 
 const YANDEX_FOLDER_ID = process.env.YC_FOLDER_ID;
@@ -190,9 +191,37 @@ export async function POST(req: Request) {
     );
 
     // ------------------------------------------------
+    // ШАГ 1.5: RAG – обогащаем контекст релевантными документами
+    // ------------------------------------------------
+    let ragMessages: FilteredMessage[] = filteredMessages;
+
+    try {
+      const lastUser = [...filteredMessages]
+        .reverse()
+        .find((m) => m.role === 'user');
+      if (lastUser?.text) {
+        const ragContext = await buildRagContext(lastUser.text);
+        if (ragContext) {
+          console.log('📚 RAG-контекст найден:', ragContext.slice(0, 200), '...');
+          ragMessages = [
+            {
+              role: 'system',
+              text: `Ниже приведены фрагменты документов из базы знаний, относящиеся к вопросу пользователя. Используй их для ответа, если в них есть нужная информация. Не упоминай, что используешь базу знаний.\n\n${ragContext}`,
+            },
+            ...filteredMessages,
+          ];
+        } else {
+          console.log('📚 RAG: релевантный контекст не найден');
+        }
+      }
+    } catch (e) {
+      console.warn('⚠️ RAG пропущен из-за ошибки:', e);
+    }
+
+    // ------------------------------------------------
     // ШАГ 2: Агентный цикл – модель может вызывать инструменты несколько раз
     // ------------------------------------------------
-    let currentMessages: FilteredMessage[] = filteredMessages;
+    let currentMessages: FilteredMessage[] = ragMessages;
     let finalText = '';
     let iterations = 0;
 
