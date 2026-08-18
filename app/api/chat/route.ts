@@ -1,5 +1,6 @@
 // app/api/chat/route.ts
 import { FilteredMessage, Message } from '@/types';
+import { callMCPTool, getMCPTools } from '@/lib/mcp';
 import { NextResponse } from 'next/server';
 
 const YANDEX_FOLDER_ID = process.env.YC_FOLDER_ID;
@@ -55,49 +56,7 @@ function filterHistory(messages: Array<Message>): Array<FilteredMessage> {
 }
 
 // ============================================================
-// 2️⃣ ОПИСАНИЕ ИНСТРУМЕНТА
-// ============================================================
-
-const tools = [
-  {
-    function: {
-      name: 'weatherTool',
-      description: 'Получает текущую погоду в указанном городе.',
-      parameters: {
-        type: 'object',
-        properties: {
-          city: {
-            type: 'string',
-            description: 'Название города, например, Москва',
-          },
-        },
-        required: ['city'],
-      },
-    },
-  },
-];
-
-// ============================================================
-// 3️⃣ РЕАЛИЗАЦИЯ ФУНКЦИИ (МОК)
-// ============================================================
-
-async function weatherTool(city: string): Promise<string> {
-  console.log(`🌤️ Вызов weatherTool с городом: ${city}`);
-  const weatherData: Record<string, string> = {
-    москва: '22°C, ☀️ Солнечно',
-    'санкт-петербург': '18°C, ⛅️ Облачно',
-    казань: '20°C, 🌧 Дождь',
-    новосибирск: '15°C, ❄️ Снег',
-  };
-  const key = city.toLowerCase();
-  const result =
-    weatherData[key] || `20°C, ⛅️ Переменная облачность в городе ${city}`;
-  console.log(`📨 Результат weatherTool: ${result}`);
-  return result;
-}
-
-// ============================================================
-// 4️⃣ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ЗАПРОСА К YANDEX
+// 2️⃣ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ ЗАПРОСА К YANDEX
 // ============================================================
 
 async function callYandex(
@@ -263,7 +222,16 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------------------
-    // ШАГ 1: Первый запрос (без стриминга) – проверяем, нужна ли функция
+    // ШАГ 1: Получаем инструменты из MCP-сервера
+    // ------------------------------------------------
+    const tools = await getMCPTools();
+
+    console.log(
+      `🔧 Инструменты из MCP: ${tools.map((t) => t.function.name).join(', ')}`,
+    );
+
+    // ------------------------------------------------
+    // ШАГ 2: Первый запрос (без стриминга) – проверяем, нужна ли функция
     // ------------------------------------------------
     const initialData = await callYandex(filteredMessages, false, tools);
     const alternative = initialData.result?.alternatives?.[0];
@@ -275,24 +243,26 @@ export async function POST(req: Request) {
     );
 
     // ------------------------------------------------
-    // ШАГ 2: Если функция вызвана – выполняем её
+    // ШАГ 3: Если функция вызвана – выполняем её через MCP
     // ------------------------------------------------
     if (toolCallList && toolCallList.toolCalls.length > 0) {
       const toolCall = toolCallList.toolCalls[0];
       const functionName = toolCall.functionCall.name;
       const args = toolCall.functionCall.arguments;
 
-      console.log(`🔧 Вызов функции: ${functionName}(${JSON.stringify(args)})`);
+      console.log(`🔧 Вызов MCP-инструмента: ${functionName}(${JSON.stringify(args)})`);
 
       let functionResult = '';
-      if (functionName === 'weatherTool') {
-        functionResult = await weatherTool(args.city);
-      } else {
-        functionResult = `❌ Неизвестная функция: ${functionName}`;
+      try {
+        functionResult = await callMCPTool(functionName, args);
+      } catch (e) {
+        functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
       }
 
+      console.log(`📨 Результат MCP-инструмента: ${functionResult}`);
+
       // ------------------------------------------------
-      // ШАГ 3: Формируем обновлённые сообщения (история + вызов + результат)
+      // ШАГ 4: Формируем обновлённые сообщения (история + вызов + результат)
       // ------------------------------------------------
       const updatedMessages: FilteredMessage[] = [
         ...filteredMessages,
@@ -323,7 +293,7 @@ export async function POST(req: Request) {
       );
 
       // ------------------------------------------------
-      // ШАГ 4: Второй запрос – уже со стримингом
+      // ШАГ 5: Второй запрос – уже со стримингом
       // ------------------------------------------------
       const streamResponse = await callYandex(updatedMessages, true, tools);
 
