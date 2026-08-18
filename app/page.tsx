@@ -3,6 +3,14 @@
 import { useState, FormEvent, useRef, useEffect } from 'react';
 import { Message } from '@/types';
 
+interface ToolEvent {
+  id: number;
+  iteration: number;
+  name: string;
+  args: Record<string, unknown>;
+  result: string | null;
+}
+
 export default function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState('');
@@ -10,6 +18,8 @@ export default function Chat() {
   const [error, setError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const [currentAssistantMessage, setCurrentAssistantMessage] = useState('');
+  const [toolEvents, setToolEvents] = useState<ToolEvent[]>([]);
+  const toolEventIdRef = useRef(0);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -26,6 +36,7 @@ export default function Chat() {
     setIsLoading(true);
     setError(null);
     setCurrentAssistantMessage('');
+    setToolEvents([]);
 
     try {
       const response = await fetch('/api/chat', {
@@ -69,6 +80,45 @@ export default function Chat() {
 
             try {
               const parsed = JSON.parse(data);
+
+              if (parsed.type === 'tool-call') {
+                toolEventIdRef.current += 1;
+                const id = toolEventIdRef.current;
+                setToolEvents((prev) => [
+                  ...prev,
+                  {
+                    id,
+                    iteration: parsed.iteration ?? 1,
+                    name: parsed.name,
+                    args: parsed.args ?? {},
+                    result: null,
+                  },
+                ]);
+              } else if (parsed.type === 'tool-result') {
+                setToolEvents((prev) => {
+                  const idx = [...prev]
+                    .reverse()
+                    .findIndex(
+                      (t) => t.name === parsed.name && t.result === null,
+                    );
+                  if (idx === -1) return prev;
+                  const target = prev.length - 1 - idx;
+                  const next = [...prev];
+                  next[target] = { ...next[target], result: parsed.result };
+                  return next;
+                });
+              } else if (parsed.type === 'iteration') {
+                setToolEvents((prev) =>
+                  prev.map((t) =>
+                    t.result === null
+                      ? { ...t, iteration: parsed.iteration }
+                      : t,
+                  ),
+                );
+              } else if (parsed.type === 'error') {
+                setError(parsed.error || 'Ошибка агента');
+              }
+
               const textChunk = parsed.text || '';
 
               if (textChunk) {
@@ -174,6 +224,43 @@ export default function Chat() {
                   </div>
                 </div>
               ))}
+              {toolEvents.length > 0 && (
+                <div className="space-y-2">
+                  {toolEvents.map((tool) => (
+                    <div
+                      key={tool.id}
+                      className="flex justify-start"
+                    >
+                      <div className="max-w-[80%] bg-amber-50 border border-amber-200 rounded-2xl px-4 py-2.5 rounded-bl-sm shadow-sm w-full">
+                        <div className="text-xs font-semibold text-amber-700 mb-1 flex items-center gap-1.5">
+                          🔧 Инструмент{' '}
+                          <code className="bg-amber-100 px-1.5 py-0.5 rounded text-amber-800">
+                            {tool.name}
+                          </code>
+                          <span className="text-amber-500 font-normal">
+                            (итерация {tool.iteration})
+                          </span>
+                        </div>
+                        <div className="text-xs text-amber-800 mb-1 break-all">
+                          <span className="text-amber-600">вызов:</span>{' '}
+                          {JSON.stringify(tool.args)}
+                        </div>
+                        {tool.result !== null ? (
+                          <div className="text-xs text-amber-800 break-words whitespace-pre-wrap">
+                            <span className="text-amber-600">→ результат:</span>{' '}
+                            {tool.result}
+                          </div>
+                        ) : (
+                          <div className="flex items-center gap-2 text-xs text-amber-600">
+                            <span className="w-1.5 h-1.5 bg-amber-500 rounded-full animate-ping" />
+                            выполняется...
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
               {isLoading && (
                 <div className="flex justify-start">
                   <div className="bg-white border border-gray-200 rounded-2xl px-4 py-3 rounded-bl-sm shadow-sm">

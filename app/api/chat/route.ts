@@ -1,6 +1,6 @@
 // app/api/chat/route.ts
 import { FilteredMessage, Message } from '@/types';
-import { callMCPTool, getMCPTools } from '@/lib/mcp';
+import { callMCPTool, getMCPTools, YandexTool } from '@/lib/mcp';
 import { buildRagContext } from '@/lib/rag';
 import { NextResponse } from 'next/server';
 
@@ -63,9 +63,14 @@ function filterHistory(messages: Array<Message>): Array<FilteredMessage> {
 async function callYandex(
   messages: Array<FilteredMessage>,
   stream: boolean,
-  tools?: any,
+  tools?: YandexTool[],
 ) {
-  const body: any = {
+  const body: {
+    modelUri: string;
+    completionOptions: Record<string, unknown>;
+    messages: Array<FilteredMessage>;
+    tools?: YandexTool[];
+  } = {
     modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite/latest`,
     completionOptions: {
       stream,
@@ -101,7 +106,7 @@ async function callYandex(
 }
 
 // ============================================================
-// 5️⃣ СТРИМИНГ ФИНАЛЬНОГО ОТВЕТА КЛИЕНТУ
+// 5️⃣ СТРИМИНГ АГЕНТНОГО ПРОЦЕССА КЛИЕНТУ
 // ============================================================
 
 const MAX_AGENT_ITERATIONS = 5;
@@ -118,38 +123,134 @@ function splitIntoChunks(text: string, size: number): string[] {
   return chunks.length > 0 ? chunks : [''];
 }
 
-function streamTextResponse(text: string): Response {
+function enqueueSSE(
+  controller: ReadableStreamDefaultController,
+  encoder: TextEncoder,
+  data: Record<string, unknown>,
+) {
+  controller.enqueue(
+    encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
+  );
+}
+
+function streamHeaders(): HeadersInit {
+  return {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive',
+    'X-Accel-Buffering': 'no',
+  };
+}
+
+function runAgentStream(
+  initialMessages: FilteredMessage[],
+  tools: YandexTool[],
+): Response {
   const encoder = new TextEncoder();
+
   const reader = new ReadableStream({
     async start(controller) {
       try {
-        const chunks = splitIntoChunks(text, STREAM_CHUNK_SIZE);
-        for (const chunk of chunks) {
+        let currentMessages = initialMessages;
+        let iterations = 0;
+
+        while (iterations < MAX_AGENT_ITERATIONS) {
+          iterations++;
+          console.log(`🤖 Итерация ${iterations}/${MAX_AGENT_ITERATIONS}`);
+
           controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`),
+            encoder.encode(
+              `data: ${JSON.stringify({ type: 'iteration', iteration: iterations, total: MAX_AGENT_ITERATIONS })}\n\n`,
+            ),
           );
-          await new Promise((resolve) =>
-            setTimeout(resolve, STREAM_CHUNK_DELAY_MS),
+
+          const data = await callYandex(currentMessages, false, tools);
+          const alternative = data.result?.alternatives?.[0];
+          const message = alternative?.message;
+          const toolCallList = message?.toolCallList;
+
+          console.log(
+            `📥 Ответ от Yandex (итерация ${iterations}):`,
+            JSON.stringify(data, null, 2),
+          );
+
+          // Если инструменты не вызваны – это финальный ответ
+          if (!toolCallList || toolCallList.toolCalls.length === 0) {
+            const finalText = message?.text || '';
+            console.log(`✅ Финальный ответ получен (итерация ${iterations})`);
+
+            const chunks = splitIntoChunks(finalText, STREAM_CHUNK_SIZE);
+            for (const chunk of chunks) {
+              enqueueSSE(controller, encoder, { type: 'text', text: chunk });
+              await new Promise((resolve) =>
+                setTimeout(resolve, STREAM_CHUNK_DELAY_MS),
+              );
+            }
+            break;
+          }
+
+          // Выполняем все вызванные инструменты через MCP
+          const toolResults: Array<{ functionResult: { name: string; content: string } }> =
+            [];
+
+          for (const toolCall of toolCallList.toolCalls) {
+            const functionName = toolCall.functionCall.name;
+            const args = toolCall.functionCall.arguments;
+
+            console.log(
+              `🔧 Вызов MCP-инструмента: ${functionName}(${JSON.stringify(args)})`,
+            );
+
+            enqueueSSE(controller, encoder, {
+              type: 'tool-call',
+              name: functionName,
+              args,
+            });
+
+            let functionResult = '';
+            try {
+              functionResult = await callMCPTool(functionName, args);
+            } catch (e) {
+              functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
+            }
+
+            console.log(`📨 Результат MCP-инструмента ${functionName}: ${functionResult}`);
+
+            enqueueSSE(controller, encoder, {
+              type: 'tool-result',
+              name: functionName,
+              result: functionResult,
+            });
+
+            toolResults.push({ functionResult: { name: functionName, content: functionResult } });
+          }
+
+          // Добавляем вызов и результаты в историю, продолжаем цикл
+          currentMessages = [
+            ...currentMessages,
+            { role: 'assistant', toolCallList },
+            { role: 'user', toolResultList: { toolResults } },
+          ];
+
+          console.log(
+            `🔄 Обновлённые сообщения (итерация ${iterations}):`,
+            JSON.stringify(currentMessages, null, 2),
           );
         }
+
+        enqueueSSE(controller, encoder, { type: 'done' });
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       } catch (error) {
         console.error('❌ Ошибка при стриминге ответа:', error);
-        controller.error(error);
+        enqueueSSE(controller, encoder, { type: 'error', error: String(error) });
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       } finally {
         controller.close();
       }
     },
   });
 
-  return new Response(reader, {
-    headers: {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache, no-transform',
-      Connection: 'keep-alive',
-      'X-Accel-Buffering': 'no',
-    },
-  });
+  return new Response(reader, { headers: streamHeaders() });
 }
 
 // ============================================================
@@ -219,83 +320,9 @@ export async function POST(req: Request) {
     }
 
     // ------------------------------------------------
-    // ШАГ 2: Агентный цикл – модель может вызывать инструменты несколько раз
+    // ШАГ 2: Запускаем агентный процесс со стримингом
     // ------------------------------------------------
-    let currentMessages: FilteredMessage[] = ragMessages;
-    let finalText = '';
-    let iterations = 0;
-
-    while (iterations < MAX_AGENT_ITERATIONS) {
-      iterations++;
-      console.log(`🤖 Итерация ${iterations}/${MAX_AGENT_ITERATIONS}`);
-
-      // Запрос без стриминга – проверяем, нужен ли вызов инструмента
-      const data = await callYandex(currentMessages, false, tools);
-      const alternative = data.result?.alternatives?.[0];
-      const message = alternative?.message;
-      const toolCallList = message?.toolCallList;
-
-      console.log(
-        `📥 Ответ от Yandex (итерация ${iterations}):`,
-        JSON.stringify(data, null, 2),
-      );
-
-      // Если инструменты не вызваны – это финальный ответ
-      if (!toolCallList || toolCallList.toolCalls.length === 0) {
-        finalText = message?.text || '';
-        console.log(`✅ Финальный ответ получен (итерация ${iterations})`);
-        break;
-      }
-
-      // ------------------------------------------------
-      // ШАГ 3: Выполняем все вызванные инструменты через MCP
-      // ------------------------------------------------
-      const toolResults: Array<{ functionResult: { name: string; content: string } }> =
-        [];
-
-      for (const toolCall of toolCallList.toolCalls) {
-        const functionName = toolCall.functionCall.name;
-        const args = toolCall.functionCall.arguments;
-
-        console.log(
-          `🔧 Вызов MCP-инструмента: ${functionName}(${JSON.stringify(args)})`,
-        );
-
-        let functionResult = '';
-        try {
-          functionResult = await callMCPTool(functionName, args);
-        } catch (e) {
-          functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
-        }
-
-        console.log(`📨 Результат MCP-инструмента ${functionName}: ${functionResult}`);
-        toolResults.push({ functionResult: { name: functionName, content: functionResult } });
-      }
-
-      // ------------------------------------------------
-      // ШАГ 4: Добавляем вызов и результаты в историю, продолжаем цикл
-      // ------------------------------------------------
-      currentMessages = [
-        ...currentMessages,
-        { role: 'assistant', toolCallList },
-        { role: 'user', toolResultList: { toolResults } },
-      ];
-
-      console.log(
-        `🔄 Обновлённые сообщения (итерация ${iterations}):`,
-        JSON.stringify(currentMessages, null, 2),
-      );
-    }
-
-    // ------------------------------------------------
-    // ШАГ 5: Проверяем результат цикла
-    // ------------------------------------------------
-    if (!finalText) {
-      finalText = `⚠️ Не удалось получить финальный ответ за ${MAX_AGENT_ITERATIONS} итераций`;
-      console.warn(`⚠️ Лимит итераций исчерпан (${MAX_AGENT_ITERATIONS})`);
-    }
-
-    return streamTextResponse(finalText);
+    return runAgentStream(ragMessages, tools);
   } catch (error) {
     console.error('❌ Ошибка:', error);
     return NextResponse.json({ error: String(error) }, { status: 500 });
