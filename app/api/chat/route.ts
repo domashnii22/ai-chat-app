@@ -100,94 +100,53 @@ async function callYandex(
 }
 
 // ============================================================
-// 5️⃣ ФУНКЦИЯ ДЛЯ ПРЕОБРАЗОВАНИЯ СТРИМА YANDEX В НАШ ФОРМАТ
+// 5️⃣ СТРИМИНГ ФИНАЛЬНОГО ОТВЕТА КЛИЕНТУ
 // ============================================================
 
-function transformYandexStream(yandexResponse: Response): ReadableStream {
+const MAX_AGENT_ITERATIONS = 5;
+const STREAM_CHUNK_SIZE = 60;
+const STREAM_CHUNK_DELAY_MS = 15;
+
+function splitIntoChunks(text: string, size: number): string[] {
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    chunks.push(remaining.slice(0, size));
+    remaining = remaining.slice(size);
+  }
+  return chunks.length > 0 ? chunks : [''];
+}
+
+function streamTextResponse(text: string): Response {
   const encoder = new TextEncoder();
-  const reader = yandexResponse.body?.getReader();
-  const decoder = new TextDecoder();
-
-  return new ReadableStream({
+  const reader = new ReadableStream({
     async start(controller) {
-      if (!reader) {
-        controller.close();
-        return;
-      }
-
-      let buffer = '';
-      let accumulatedText = '';
-
       try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value, { stream: true });
-          buffer += chunk;
-
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmedLine = line.trim();
-            if (!trimmedLine) continue;
-
-            let text = '';
-
-            // Парсим SSE от Yandex
-            if (trimmedLine.startsWith('data: ')) {
-              const data = trimmedLine.slice(6).trim();
-              if (data === '[DONE]') continue;
-
-              try {
-                const json = JSON.parse(data);
-                text = json.result?.alternatives?.[0]?.message?.text || '';
-              } catch (e) {
-                console.error('❌ Ошибка парсинга SSE от Yandex:', e);
-              }
-            } else if (trimmedLine.startsWith('{')) {
-              // Иногда Yandex присылает JSON без префикса data:
-              try {
-                const json = JSON.parse(trimmedLine);
-                text = json.result?.alternatives?.[0]?.message?.text || '';
-              } catch (e) {
-                console.error('❌ Ошибка парсинга JSON от Yandex:', e);
-              }
-            }
-
-            if (text) {
-              // Проверяем, не дублируется ли текст
-              if (accumulatedText && text.includes(accumulatedText)) {
-                const newPart = text.replace(accumulatedText, '');
-                if (newPart) {
-                  accumulatedText = text;
-                  // Отправляем новую часть клиенту в нашем формате
-                  controller.enqueue(
-                    encoder.encode(
-                      `data: ${JSON.stringify({ text: newPart })}\n\n`,
-                    ),
-                  );
-                }
-              } else {
-                accumulatedText = text;
-                controller.enqueue(
-                  encoder.encode(`data: ${JSON.stringify({ text })}\n\n`),
-                );
-              }
-            }
-          }
+        const chunks = splitIntoChunks(text, STREAM_CHUNK_SIZE);
+        for (const chunk of chunks) {
+          controller.enqueue(
+            encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`),
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, STREAM_CHUNK_DELAY_MS),
+          );
         }
-
-        // Отправляем сигнал завершения
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
-        controller.close();
       } catch (error) {
-        console.error('❌ Ошибка при преобразовании стрима:', error);
+        console.error('❌ Ошибка при стриминге ответа:', error);
         controller.error(error);
       } finally {
-        reader.releaseLock();
+        controller.close();
       }
+    },
+  });
+
+  return new Response(reader, {
+    headers: {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
     },
   });
 }
@@ -231,102 +190,83 @@ export async function POST(req: Request) {
     );
 
     // ------------------------------------------------
-    // ШАГ 2: Первый запрос (без стриминга) – проверяем, нужна ли функция
+    // ШАГ 2: Агентный цикл – модель может вызывать инструменты несколько раз
     // ------------------------------------------------
-    const initialData = await callYandex(filteredMessages, false, tools);
-    const alternative = initialData.result?.alternatives?.[0];
-    const toolCallList = alternative?.message?.toolCallList;
+    let currentMessages: FilteredMessage[] = filteredMessages;
+    let finalText = '';
+    let iterations = 0;
 
-    console.log(
-      '📥 Ответ от Yandex (первый запрос):',
-      JSON.stringify(initialData, null, 2),
-    );
+    while (iterations < MAX_AGENT_ITERATIONS) {
+      iterations++;
+      console.log(`🤖 Итерация ${iterations}/${MAX_AGENT_ITERATIONS}`);
 
-    // ------------------------------------------------
-    // ШАГ 3: Если функция вызвана – выполняем её через MCP
-    // ------------------------------------------------
-    if (toolCallList && toolCallList.toolCalls.length > 0) {
-      const toolCall = toolCallList.toolCalls[0];
-      const functionName = toolCall.functionCall.name;
-      const args = toolCall.functionCall.arguments;
+      // Запрос без стриминга – проверяем, нужен ли вызов инструмента
+      const data = await callYandex(currentMessages, false, tools);
+      const alternative = data.result?.alternatives?.[0];
+      const message = alternative?.message;
+      const toolCallList = message?.toolCallList;
 
-      console.log(`🔧 Вызов MCP-инструмента: ${functionName}(${JSON.stringify(args)})`);
+      console.log(
+        `📥 Ответ от Yandex (итерация ${iterations}):`,
+        JSON.stringify(data, null, 2),
+      );
 
-      let functionResult = '';
-      try {
-        functionResult = await callMCPTool(functionName, args);
-      } catch (e) {
-        functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
+      // Если инструменты не вызваны – это финальный ответ
+      if (!toolCallList || toolCallList.toolCalls.length === 0) {
+        finalText = message?.text || '';
+        console.log(`✅ Финальный ответ получен (итерация ${iterations})`);
+        break;
       }
 
-      console.log(`📨 Результат MCP-инструмента: ${functionResult}`);
+      // ------------------------------------------------
+      // ШАГ 3: Выполняем все вызванные инструменты через MCP
+      // ------------------------------------------------
+      const toolResults: Array<{ functionResult: { name: string; content: string } }> =
+        [];
+
+      for (const toolCall of toolCallList.toolCalls) {
+        const functionName = toolCall.functionCall.name;
+        const args = toolCall.functionCall.arguments;
+
+        console.log(
+          `🔧 Вызов MCP-инструмента: ${functionName}(${JSON.stringify(args)})`,
+        );
+
+        let functionResult = '';
+        try {
+          functionResult = await callMCPTool(functionName, args);
+        } catch (e) {
+          functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
+        }
+
+        console.log(`📨 Результат MCP-инструмента ${functionName}: ${functionResult}`);
+        toolResults.push({ functionResult: { name: functionName, content: functionResult } });
+      }
 
       // ------------------------------------------------
-      // ШАГ 4: Формируем обновлённые сообщения (история + вызов + результат)
+      // ШАГ 4: Добавляем вызов и результаты в историю, продолжаем цикл
       // ------------------------------------------------
-      const updatedMessages: FilteredMessage[] = [
-        ...filteredMessages,
-        {
-          role: 'assistant',
-          toolCallList: {
-            toolCalls: toolCallList.toolCalls,
-          },
-        },
-        {
-          role: 'user',
-          toolResultList: {
-            toolResults: [
-              {
-                functionResult: {
-                  name: functionName,
-                  content: functionResult,
-                },
-              },
-            ],
-          },
-        },
+      currentMessages = [
+        ...currentMessages,
+        { role: 'assistant', toolCallList },
+        { role: 'user', toolResultList: { toolResults } },
       ];
 
       console.log(
-        '📤 Обновлённые сообщения для второго запроса:',
-        JSON.stringify(updatedMessages, null, 2),
+        `🔄 Обновлённые сообщения (итерация ${iterations}):`,
+        JSON.stringify(currentMessages, null, 2),
       );
-
-      // ------------------------------------------------
-      // ШАГ 5: Второй запрос – уже со стримингом
-      // ------------------------------------------------
-      const streamResponse = await callYandex(updatedMessages, true, tools);
-
-      // Преобразуем стрим от Yandex в наш формат
-      const transformedStream = transformYandexStream(streamResponse);
-
-      return new Response(transformedStream, {
-        headers: {
-          'Content-Type': 'text/event-stream',
-          'Cache-Control': 'no-cache, no-transform',
-          Connection: 'keep-alive',
-          'X-Accel-Buffering': 'no',
-        },
-      });
     }
 
     // ------------------------------------------------
-    // Если функция не вызывалась – сразу стримим ответ
+    // ШАГ 5: Проверяем результат цикла
     // ------------------------------------------------
-    console.log('💬 Функция не вызвана, стримим прямой ответ');
-    const streamResponse = await callYandex(filteredMessages, true);
+    if (!finalText) {
+      finalText = `⚠️ Не удалось получить финальный ответ за ${MAX_AGENT_ITERATIONS} итераций`;
+      console.warn(`⚠️ Лимит итераций исчерпан (${MAX_AGENT_ITERATIONS})`);
+    }
 
-    // Преобразуем стрим от Yandex в наш формат
-    const transformedStream = transformYandexStream(streamResponse);
-
-    return new Response(transformedStream, {
-      headers: {
-        'Content-Type': 'text/event-stream',
-        'Cache-Control': 'no-cache, no-transform',
-        Connection: 'keep-alive',
-        'X-Accel-Buffering': 'no',
-      },
-    });
+    return streamTextResponse(finalText);
   } catch (error) {
     console.error('❌ Ошибка:', error);
     return NextResponse.json({ error: String(error) }, { status: 500 });
