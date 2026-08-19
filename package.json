@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
+    "dev:mcp": "npx -y @modelcontextprotocol/server-everything streamableHttp",
     "build": "next build",
     "start": "next start",
     "lint": "eslint"
