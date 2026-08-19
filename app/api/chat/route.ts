@@ -71,7 +71,10 @@ async function callYandex(
     messages: Array<FilteredMessage>;
     tools?: YandexTool[];
   } = {
+    // Модель для агента: yandexgpt (pro) — надёжнее в агентном сценарии.
+    // Быстрый возврат к lite: раскомментируй строку с yandexgpt-lite ниже.
     modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt-lite/latest`,
+    // modelUri: `gpt://${YANDEX_FOLDER_ID}/yandexgpt/latest`,
     completionOptions: {
       stream,
       temperature: 0.7,
@@ -113,6 +116,25 @@ const MAX_AGENT_ITERATIONS = 5;
 const STREAM_CHUNK_SIZE = 60;
 const STREAM_CHUNK_DELAY_MS = 15;
 
+const SYSTEM_PROMPT =
+  'Ты — полезный ассистент. Отвечай пользователю из своих знаний, на русском языке. ' +
+  'Инструменты (tools) вызывай ТОЛЬКО когда это действительно необходимо: нужны данные из ресурса, ' +
+  'вычисления, файловые операции и т.п. Если подходящего инструмента нет — отвечай обычным текстом, ' +
+  'не отказывайся и не выдумывай вызовы инструментов.';
+
+function prependSystemPrompt(
+  initialMessages: FilteredMessage[],
+): FilteredMessage[] {
+  const [first, ...rest] = initialMessages;
+  if (first?.role === 'system') {
+    return [
+      { role: 'system', text: `${SYSTEM_PROMPT}\n\n${first.text}` },
+      ...rest,
+    ];
+  }
+  return [{ role: 'system', text: SYSTEM_PROMPT }, ...initialMessages];
+}
+
 function splitIntoChunks(text: string, size: number): string[] {
   const chunks: string[] = [];
   let remaining = text;
@@ -128,9 +150,7 @@ function enqueueSSE(
   encoder: TextEncoder,
   data: Record<string, unknown>,
 ) {
-  controller.enqueue(
-    encoder.encode(`data: ${JSON.stringify(data)}\n\n`),
-  );
+  controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
 }
 
 function streamHeaders(): HeadersInit {
@@ -151,7 +171,7 @@ function runAgentStream(
   const reader = new ReadableStream({
     async start(controller) {
       try {
-        let currentMessages = initialMessages;
+        let currentMessages = prependSystemPrompt(initialMessages);
         let iterations = 0;
 
         while (iterations < MAX_AGENT_ITERATIONS) {
@@ -190,8 +210,9 @@ function runAgentStream(
           }
 
           // Выполняем все вызванные инструменты через MCP
-          const toolResults: Array<{ functionResult: { name: string; content: string } }> =
-            [];
+          const toolResults: Array<{
+            functionResult: { name: string; content: string };
+          }> = [];
 
           for (const toolCall of toolCallList.toolCalls) {
             const functionName = toolCall.functionCall.name;
@@ -214,7 +235,9 @@ function runAgentStream(
               functionResult = `❌ Ошибка вызова инструмента ${functionName}: ${String(e)}`;
             }
 
-            console.log(`📨 Результат MCP-инструмента ${functionName}: ${functionResult}`);
+            console.log(
+              `📨 Результат MCP-инструмента ${functionName}: ${functionResult}`,
+            );
 
             enqueueSSE(controller, encoder, {
               type: 'tool-result',
@@ -222,7 +245,9 @@ function runAgentStream(
               result: functionResult,
             });
 
-            toolResults.push({ functionResult: { name: functionName, content: functionResult } });
+            toolResults.push({
+              functionResult: { name: functionName, content: functionResult },
+            });
           }
 
           // Добавляем вызов и результаты в историю, продолжаем цикл
@@ -242,7 +267,10 @@ function runAgentStream(
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       } catch (error) {
         console.error('❌ Ошибка при стриминге ответа:', error);
-        enqueueSSE(controller, encoder, { type: 'error', error: String(error) });
+        enqueueSSE(controller, encoder, {
+          type: 'error',
+          error: String(error),
+        });
         controller.enqueue(encoder.encode('data: [DONE]\n\n'));
       } finally {
         controller.close();
@@ -303,7 +331,11 @@ export async function POST(req: Request) {
       if (lastUser?.text) {
         const ragContext = await buildRagContext(lastUser.text);
         if (ragContext) {
-          console.log('📚 RAG-контекст найден:', ragContext.slice(0, 200), '...');
+          console.log(
+            '📚 RAG-контекст найден:',
+            ragContext.slice(0, 200),
+            '...',
+          );
           ragMessages = [
             {
               role: 'system',
